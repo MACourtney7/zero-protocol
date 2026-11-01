@@ -7,12 +7,12 @@ pub mod mesh;
 pub mod webrtc;
 
 pub use crypto::WasmCryptoSession;
-pub use mesh::MeshTopology;
-pub use mesh::MeshTopologyManager;
 #[allow(unused_imports)]
 pub use crypto::*;
 #[allow(unused_imports)]
 pub use invite::*;
+pub use mesh::MeshTopology;
+pub use mesh::MeshTopologyManager;
 #[allow(unused_imports)]
 pub use mesh::*;
 #[allow(unused_imports)]
