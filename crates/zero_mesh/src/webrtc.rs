@@ -609,6 +609,12 @@ impl Default for WasmWebRtcEngine {
     }
 }
 
+impl WasmWebRtcEngine {
+    pub fn peer(&self) -> WebRtcPeer {
+        self.peer.clone()
+    }
+}
+
 #[wasm_bindgen]
 impl WasmWebRtcEngine {
     /// Creates a new `WasmWebRtcEngine` instance.

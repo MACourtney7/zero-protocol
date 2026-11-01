@@ -82,6 +82,18 @@ pub struct DropPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageInviteRequest {
+    pub invite: InvitePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MatchResponse {
+    Matched { invite: InvitePayload },
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedFrame {
     pub nonce: [u8; 12],
     pub ciphertext: Vec<u8>,
@@ -147,6 +159,13 @@ pub enum MeshRelaySignal {
         origin_peer_id: String,
         ttl: u8,
         sealed_message: SealedFrame,
+    },
+    BroadcastState {
+        packet_uuid: String,
+        origin_peer_id: String,
+        topic: String,
+        ttl: u8,
+        sealed_payload: SealedFrame,
     },
 }
 
@@ -378,5 +397,82 @@ mod tests {
         assert_eq!(relay.ttl, 0);
         assert!(!relay.decrement_ttl());
         assert_eq!(relay.ttl, 0);
+    }
+
+    #[test]
+    fn test_broadcast_state_roundtrip() {
+        let sealed = SealedFrame::new([1u8; 12], vec![10, 20, 30]);
+        let relay = MeshRelayMessage::new(
+            "frame-state-1",
+            3,
+            MeshRelaySignal::BroadcastState {
+                packet_uuid: "pkt-123".to_string(),
+                origin_peer_id: "peer-origin".to_string(),
+                topic: "player_position".to_string(),
+                ttl: 3,
+                sealed_payload: sealed,
+            },
+        );
+        let json = to_json_string(&relay).expect("serialize BroadcastState");
+        let decoded: MeshRelayMessage = from_json_str(&json).expect("deserialize BroadcastState");
+        assert_eq!(relay, decoded);
+
+        let bytes = to_json_bytes(&relay).expect("serialize bytes");
+        let decoded_bytes: MeshRelayMessage = from_json_bytes(&bytes).expect("deserialize bytes");
+        assert_eq!(relay, decoded_bytes);
+    }
+
+    #[test]
+    fn test_stage_invite_request_roundtrip() {
+        let invite = InvitePayload {
+            do_id: "room-abc".to_string(),
+            invite_uuid: "inv-uuid-1".to_string(),
+            token: "tok-1".to_string(),
+            sdp_offer: SdpOffer {
+                sdp: "v=0...".to_string(),
+            },
+            host_public_key: [7u8; 32],
+            guest_private_key: None,
+            host_peer_id: Some("host-1".to_string()),
+            assigned_peer_id: None,
+            host_signing_key: None,
+        };
+        let req = StageInviteRequest {
+            invite: invite.clone(),
+        };
+        let json = to_json_string(&req).expect("serialize StageInviteRequest");
+        let decoded: StageInviteRequest =
+            from_json_str(&json).expect("deserialize StageInviteRequest");
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn test_match_response_roundtrip() {
+        let invite = InvitePayload {
+            do_id: "room-abc".to_string(),
+            invite_uuid: "inv-uuid-1".to_string(),
+            token: "tok-1".to_string(),
+            sdp_offer: SdpOffer {
+                sdp: "v=0...".to_string(),
+            },
+            host_public_key: [7u8; 32],
+            guest_private_key: None,
+            host_peer_id: Some("host-1".to_string()),
+            assigned_peer_id: None,
+            host_signing_key: None,
+        };
+        let matched = MatchResponse::Matched { invite };
+        let json_matched = to_json_string(&matched).expect("serialize MatchResponse::Matched");
+        assert!(json_matched.contains(r#""status":"matched""#));
+        let decoded_matched: MatchResponse =
+            from_json_str(&json_matched).expect("deserialize MatchResponse::Matched");
+        assert_eq!(matched, decoded_matched);
+
+        let empty = MatchResponse::Empty;
+        let json_empty = to_json_string(&empty).expect("serialize MatchResponse::Empty");
+        assert_eq!(json_empty, r#"{"status":"empty"}"#);
+        let decoded_empty: MatchResponse =
+            from_json_str(&json_empty).expect("deserialize MatchResponse::Empty");
+        assert_eq!(empty, decoded_empty);
     }
 }

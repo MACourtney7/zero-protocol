@@ -125,6 +125,7 @@ pub const MAX_HANDSHAKE_RETRIES: usize = 5;
 pub const NON_INITIATOR_GRACE_TICKS: usize = 2;
 
 pub type MessageCallback = Rc<dyn Fn(&str, &str)>; // (sender_id, plaintext)
+pub type StateCallback = Rc<dyn Fn(&str, &str, &[u8])>; // (origin_peer_id, topic, payload)
 pub type PeerEventCallback = Rc<dyn Fn(&str)>; // (peer_id)
 pub type BurnPeerCallback = Rc<dyn Fn(&str)>;
 pub type GlobalBurnCallback = Rc<dyn Fn(&str)>;
@@ -154,6 +155,7 @@ struct MeshTopologyInner {
     max_seen_cache: usize,
     has_burned: bool,
     on_message_callbacks: Vec<MessageCallback>,
+    on_state_callbacks: Vec<StateCallback>,
     on_peer_joined_callbacks: Vec<PeerEventCallback>,
     on_peer_left_callbacks: Vec<PeerEventCallback>,
     on_burn_peer_messages_callbacks: Vec<BurnPeerCallback>,
@@ -183,6 +185,7 @@ impl MeshTopology {
                 max_seen_cache: 1024,
                 has_burned: false,
                 on_message_callbacks: Vec::new(),
+                on_state_callbacks: Vec::new(),
                 on_peer_joined_callbacks: Vec::new(),
                 on_peer_left_callbacks: Vec::new(),
                 on_burn_peer_messages_callbacks: Vec::new(),
@@ -699,6 +702,14 @@ impl MeshTopology {
             .push(Rc::new(callback));
     }
 
+    /// Subscribes to decrypted application state/binary broadcast and direct transmission events.
+    pub fn on_state<F: Fn(&str, &str, &[u8]) + 'static>(&self, callback: F) {
+        self.inner
+            .borrow_mut()
+            .on_state_callbacks
+            .push(Rc::new(callback));
+    }
+
     /// Subscribes to peer joined events.
     pub fn on_peer_joined<F: Fn(&str) + 'static>(&self, callback: F) {
         self.inner
@@ -1139,6 +1150,110 @@ impl MeshTopology {
                     Ok(())
                 }
 
+                MeshRelaySignal::BroadcastState {
+                    ref packet_uuid,
+                    ref origin_peer_id,
+                    ref topic,
+                    ttl,
+                    ref sealed_payload,
+                } => {
+                    // Deduplication check
+                    {
+                        let mut inner = self.inner.borrow_mut();
+                        if inner.seen_messages.contains(packet_uuid) {
+                            return Ok(()); // Suppress duplicate immediately
+                        }
+                        if inner.seen_message_order.len() >= inner.max_seen_cache {
+                            let oldest = inner.seen_message_order.remove(0);
+                            inner.seen_messages.remove(&oldest);
+                        }
+                        inner.seen_messages.insert(packet_uuid.clone());
+                        inner.seen_message_order.push(packet_uuid.clone());
+                    }
+
+                    // Decrypt incoming payload (try from_peer_id session crypto first, then origin_peer_id)
+                    let decrypted = {
+                        let inner = self.inner.borrow();
+                        let from_crypto = inner
+                            .peers
+                            .get(from_peer_id)
+                            .and_then(|p| p.session_crypto.clone());
+                        let origin_crypto = inner
+                            .peers
+                            .get(origin_peer_id)
+                            .and_then(|p| p.session_crypto.clone());
+
+                        let mut dec = None;
+                        if let Some(ref c) = from_crypto {
+                            if let Ok(bytes) = c.open_raw(sealed_payload) {
+                                dec = Some(bytes);
+                            }
+                        }
+                        if dec.is_none() {
+                            if let Some(ref c) = origin_crypto {
+                                if let Ok(bytes) = c.open_raw(sealed_payload) {
+                                    dec = Some(bytes);
+                                }
+                            }
+                        }
+                        dec.ok_or_else(|| {
+                            MeshError::Crypto(CryptoError::DecryptionFailed(
+                                "Failed to authenticate or decrypt broadcast state payload"
+                                    .to_string(),
+                            ))
+                        })?
+                    };
+
+                    // Deliver state payload to on_state callbacks
+                    let callbacks = self.inner.borrow().on_state_callbacks.clone();
+                    for cb in callbacks {
+                        cb(origin_peer_id, topic, &decrypted);
+                    }
+
+                    // Relay downstream if ttl > 1
+                    if ttl > 1 {
+                        let downstream_peers: Vec<(String, WebRtcPeer, Option<ChatSessionCrypto>)> = {
+                            let inner = self.inner.borrow();
+                            inner
+                                .peers
+                                .iter()
+                                .filter(|(id, _)| *id != from_peer_id && *id != origin_peer_id)
+                                .map(|(id, p)| {
+                                    (
+                                        id.clone(),
+                                        p.rtc_peer.clone(),
+                                        p.session_crypto.clone(),
+                                    )
+                                })
+                                .collect()
+                        };
+
+                        for (_peer_id, rtc_peer, session_crypto) in downstream_peers {
+                            if let Some(crypto) = session_crypto {
+                                if let Ok(sealed) = crypto.seal_raw(&decrypted) {
+                                    let fwd = MeshRelayMessage {
+                                        frame_id: generate_message_uuid()
+                                            .unwrap_or_else(|_| packet_uuid.clone()),
+                                        ttl: ttl - 1,
+                                        signal: MeshRelaySignal::BroadcastState {
+                                            packet_uuid: packet_uuid.clone(),
+                                            origin_peer_id: origin_peer_id.clone(),
+                                            topic: topic.clone(),
+                                            ttl: ttl - 1,
+                                            sealed_payload: sealed,
+                                        },
+                                    };
+                                    if let Ok(json) = to_json_string(&fwd) {
+                                        let _ = rtc_peer.send_text(&json);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(())
+                }
+
                 MeshRelaySignal::PeerLeftAndBurn { ref peer_id } => {
                     // Deduplicate using seen_messages / frame_id
                     {
@@ -1351,6 +1466,118 @@ impl MeshTopology {
         }
 
         Ok(message_uuid)
+    }
+
+    /// Broadcasts an encrypted application state or binary event payload across all directly
+    /// connected peers in the mesh, with downstream flooding relay up to `ttl` hops.
+    pub fn broadcast_state(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        ttl: u8,
+    ) -> Result<String, MeshError> {
+        let packet_uuid = generate_message_uuid()?;
+
+        // Record in local deduplication cache
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.seen_messages.contains(&packet_uuid) {
+                return Ok(packet_uuid);
+            }
+            if inner.seen_message_order.len() >= inner.max_seen_cache {
+                let oldest = inner.seen_message_order.remove(0);
+                inner.seen_messages.remove(&oldest);
+            }
+            inner.seen_messages.insert(packet_uuid.clone());
+            inner.seen_message_order.push(packet_uuid.clone());
+        }
+
+        let peers: Vec<(WebRtcPeer, Option<ChatSessionCrypto>)> = {
+            let inner = self.inner.borrow();
+            inner
+                .peers
+                .values()
+                .map(|p| (p.rtc_peer.clone(), p.session_crypto.clone()))
+                .collect()
+        };
+
+        for (rtc_peer, session_crypto) in peers {
+            if let Some(crypto) = session_crypto {
+                let sealed_payload = crypto.seal_raw(payload)?;
+                let relay_msg = MeshRelayMessage {
+                    frame_id: generate_message_uuid().unwrap_or_else(|_| packet_uuid.clone()),
+                    ttl,
+                    signal: MeshRelaySignal::BroadcastState {
+                        packet_uuid: packet_uuid.clone(),
+                        origin_peer_id: self.local_peer_id(),
+                        topic: topic.to_string(),
+                        ttl,
+                        sealed_payload,
+                    },
+                };
+                let raw_json = to_json_string(&relay_msg)?;
+                let _ = rtc_peer.send_text(&raw_json);
+            }
+        }
+
+        Ok(packet_uuid)
+    }
+
+    /// Transmits an encrypted state or binary event payload directly to a specific target peer
+    /// with TTL = 1 without relaying to the broader mesh.
+    pub fn send_direct_state(
+        &self,
+        target_peer_id: &str,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<String, MeshError> {
+        let packet_uuid = generate_message_uuid()?;
+
+        // Record in local deduplication cache
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.seen_messages.contains(&packet_uuid) {
+                return Ok(packet_uuid);
+            }
+            if inner.seen_message_order.len() >= inner.max_seen_cache {
+                let oldest = inner.seen_message_order.remove(0);
+                inner.seen_messages.remove(&oldest);
+            }
+            inner.seen_messages.insert(packet_uuid.clone());
+            inner.seen_message_order.push(packet_uuid.clone());
+        }
+
+        let (rtc_peer, session_crypto) = {
+            let inner = self.inner.borrow();
+            let peer = inner
+                .peers
+                .get(target_peer_id)
+                .ok_or_else(|| MeshError::PeerNotFound(target_peer_id.to_string()))?;
+            (peer.rtc_peer.clone(), peer.session_crypto.clone())
+        };
+
+        let crypto = session_crypto.ok_or_else(|| {
+            MeshError::Crypto(CryptoError::DecryptionFailed(format!(
+                "No session crypto established for peer '{target_peer_id}'"
+            )))
+        })?;
+
+        let sealed_payload = crypto.seal_raw(payload)?;
+        let relay_msg = MeshRelayMessage {
+            frame_id: generate_message_uuid().unwrap_or_else(|_| packet_uuid.clone()),
+            ttl: 1,
+            signal: MeshRelaySignal::BroadcastState {
+                packet_uuid: packet_uuid.clone(),
+                origin_peer_id: self.local_peer_id(),
+                topic: topic.to_string(),
+                ttl: 1,
+                sealed_payload,
+            },
+        };
+        let raw_json = to_json_string(&relay_msg)?;
+        rtc_peer.send_text(&raw_json)?;
+
+        Ok(packet_uuid)
     }
 
     /// Broadcasts a leave and selective burn signal to all connected peers,
@@ -2271,6 +2498,164 @@ mod tests {
 
         let err = alice_mesh
             .mark_peer_disconnected_grace("ghost", 5000)
+            .unwrap_err();
+        assert_eq!(err, MeshError::PeerNotFound("ghost".to_string()));
+    }
+
+    #[test]
+    fn test_broadcast_state_flooding_and_deduplication() {
+        let (alice_sk, alice_pk) = generate_kp();
+        let (bob_sk, bob_pk) = generate_kp();
+        let (charlie_sk, charlie_pk) = generate_kp();
+
+        let alice_mesh = MeshTopology::new("alice", alice_sk);
+        let bob_mesh = MeshTopology::new("bob", bob_sk);
+        let charlie_mesh = MeshTopology::new("charlie", charlie_sk);
+
+        // Fully connected mesh (triangle)
+        let alice_to_bob = WebRtcPeer::new();
+        let bob_to_alice = WebRtcPeer::new();
+        WebRtcPeer::pair_for_testing(&alice_to_bob, &bob_to_alice).unwrap();
+        alice_mesh.add_peer("bob", bob_pk, alice_to_bob).unwrap();
+        bob_mesh.add_peer("alice", alice_pk, bob_to_alice).unwrap();
+
+        let alice_to_charlie = WebRtcPeer::new();
+        let charlie_to_alice = WebRtcPeer::new();
+        WebRtcPeer::pair_for_testing(&alice_to_charlie, &charlie_to_alice).unwrap();
+        alice_mesh
+            .add_peer("charlie", charlie_pk, alice_to_charlie)
+            .unwrap();
+        charlie_mesh
+            .add_peer("alice", alice_pk, charlie_to_alice)
+            .unwrap();
+
+        let bob_to_charlie = WebRtcPeer::new();
+        let charlie_to_bob = WebRtcPeer::new();
+        WebRtcPeer::pair_for_testing(&bob_to_charlie, &charlie_to_bob).unwrap();
+        bob_mesh
+            .add_peer("charlie", charlie_pk, bob_to_charlie)
+            .unwrap();
+        charlie_mesh.add_peer("bob", bob_pk, charlie_to_bob).unwrap();
+
+        let alice_states = Rc::new(RefCell::new(Vec::new()));
+        let a_clone = alice_states.clone();
+        alice_mesh.on_state(move |orig, topic, payload| {
+            a_clone
+                .borrow_mut()
+                .push((orig.to_string(), topic.to_string(), payload.to_vec()));
+        });
+
+        let bob_states = Rc::new(RefCell::new(Vec::new()));
+        let b_clone = bob_states.clone();
+        bob_mesh.on_state(move |orig, topic, payload| {
+            b_clone
+                .borrow_mut()
+                .push((orig.to_string(), topic.to_string(), payload.to_vec()));
+        });
+
+        let charlie_states = Rc::new(RefCell::new(Vec::new()));
+        let c_clone = charlie_states.clone();
+        charlie_mesh.on_state(move |orig, topic, payload| {
+            c_clone
+                .borrow_mut()
+                .push((orig.to_string(), topic.to_string(), payload.to_vec()));
+        });
+
+        // Bob broadcasts state
+        let payload = b"pos: 100,200,300";
+        let pkt_uuid = bob_mesh
+            .broadcast_state("player_position", payload, 3)
+            .expect("broadcast_state succeeds");
+
+        assert_eq!(alice_states.borrow().len(), 1);
+        assert_eq!(
+            alice_states.borrow()[0],
+            (
+                "bob".to_string(),
+                "player_position".to_string(),
+                payload.to_vec()
+            )
+        );
+
+        assert_eq!(charlie_states.borrow().len(), 1);
+        assert_eq!(
+            charlie_states.borrow()[0],
+            (
+                "bob".to_string(),
+                "player_position".to_string(),
+                payload.to_vec()
+            )
+        );
+
+        // Bob loopback suppression
+        assert_eq!(bob_states.borrow().len(), 0);
+
+        // Re-inject duplicate to Alice
+        let alice_crypto = ChatSessionCrypto::from_keypair_and_peer_public(&alice_sk, &bob_pk);
+        let sealed = alice_crypto.seal_raw(payload).unwrap();
+        let dup_msg = MeshRelayMessage {
+            frame_id: "dup-frame-state-001".to_string(),
+            ttl: 2,
+            signal: MeshRelaySignal::BroadcastState {
+                packet_uuid: pkt_uuid,
+                origin_peer_id: "bob".to_string(),
+                topic: "player_position".to_string(),
+                ttl: 2,
+                sealed_payload: sealed,
+            },
+        };
+        let dup_json = to_json_string(&dup_msg).unwrap();
+        block_on(alice_mesh.handle_incoming_message("bob", &dup_json)).unwrap();
+
+        // Alice count remains 1 (duplicate suppressed)
+        assert_eq!(alice_states.borrow().len(), 1);
+    }
+
+    #[test]
+    fn test_send_direct_state() {
+        let (alice_sk, alice_pk) = generate_kp();
+        let (bob_sk, bob_pk) = generate_kp();
+        let (_charlie_sk, charlie_pk) = generate_kp();
+
+        let alice_mesh = MeshTopology::new("alice", alice_sk);
+        let bob_mesh = MeshTopology::new("bob", bob_sk);
+
+        let alice_to_bob = WebRtcPeer::new();
+        let bob_to_alice = WebRtcPeer::new();
+        WebRtcPeer::pair_for_testing(&alice_to_bob, &bob_to_alice).unwrap();
+        alice_mesh.add_peer("bob", bob_pk, alice_to_bob).unwrap();
+        bob_mesh.add_peer("alice", alice_pk, bob_to_alice).unwrap();
+
+        let alice_to_charlie = WebRtcPeer::new();
+        alice_to_charlie.mark_open_for_testing().unwrap();
+        alice_mesh
+            .add_peer("charlie", charlie_pk, alice_to_charlie)
+            .unwrap();
+
+        let bob_states = Rc::new(RefCell::new(Vec::new()));
+        let b_clone = bob_states.clone();
+        bob_mesh.on_state(move |orig, topic, payload| {
+            b_clone
+                .borrow_mut()
+                .push((orig.to_string(), topic.to_string(), payload.to_vec()));
+        });
+
+        // Direct send to Bob
+        let payload = b"whisper_secret_123";
+        let uuid = alice_mesh
+            .send_direct_state("bob", "whisper", payload)
+            .expect("send_direct_state succeeds");
+        assert!(!uuid.is_empty());
+
+        assert_eq!(bob_states.borrow().len(), 1);
+        assert_eq!(
+            bob_states.borrow()[0],
+            ("alice".to_string(), "whisper".to_string(), payload.to_vec())
+        );
+
+        // Sending to non-existent peer returns PeerNotFound
+        let err = alice_mesh
+            .send_direct_state("ghost", "whisper", payload)
             .unwrap_err();
         assert_eq!(err, MeshError::PeerNotFound("ghost".to_string()));
     }
