@@ -1219,11 +1219,7 @@ impl MeshTopology {
                                 .iter()
                                 .filter(|(id, _)| *id != from_peer_id && *id != origin_peer_id)
                                 .map(|(id, p)| {
-                                    (
-                                        id.clone(),
-                                        p.rtc_peer.clone(),
-                                        p.session_crypto.clone(),
-                                    )
+                                    (id.clone(), p.rtc_peer.clone(), p.session_crypto.clone())
                                 })
                                 .collect()
                         };
@@ -2535,7 +2531,9 @@ mod tests {
         bob_mesh
             .add_peer("charlie", charlie_pk, bob_to_charlie)
             .unwrap();
-        charlie_mesh.add_peer("bob", bob_pk, charlie_to_bob).unwrap();
+        charlie_mesh
+            .add_peer("bob", bob_pk, charlie_to_bob)
+            .unwrap();
 
         let alice_states = Rc::new(RefCell::new(Vec::new()));
         let a_clone = alice_states.clone();

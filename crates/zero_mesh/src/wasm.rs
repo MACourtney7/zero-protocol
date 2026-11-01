@@ -18,7 +18,9 @@ impl WasmMeshTopology {
     #[wasm_bindgen(constructor)]
     pub fn new(local_peer_id: &str, local_private_key: &[u8]) -> Result<WasmMeshTopology, JsValue> {
         if local_private_key.len() != 32 {
-            return Err(JsValue::from_str("Invalid private key length: expected 32 bytes"));
+            return Err(JsValue::from_str(
+                "Invalid private key length: expected 32 bytes",
+            ));
         }
         let mut priv_arr = [0u8; 32];
         priv_arr.copy_from_slice(local_private_key);
@@ -45,7 +47,9 @@ impl WasmMeshTopology {
         engine: &WasmWebRtcEngine,
     ) -> Result<(), JsValue> {
         if public_key.len() != 32 {
-            return Err(JsValue::from_str("Invalid public key length: expected 32 bytes"));
+            return Err(JsValue::from_str(
+                "Invalid public key length: expected 32 bytes",
+            ));
         }
         let mut pk_arr = [0u8; 32];
         pk_arr.copy_from_slice(public_key);
