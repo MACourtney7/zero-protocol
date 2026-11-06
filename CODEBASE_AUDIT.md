@@ -1,5 +1,13 @@
 # zero_protocol Codebase Dump
 
+## FILE: .gitignore
+```
+.DS_Store
+/target
+target/
+**/*.rs.bk
+```
+
 ## FILE: Cargo.toml
 ```toml
 [workspace]
@@ -13,7 +21,6 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-
 ```
 
 ## FILE: crates/zero_mesh/Cargo.toml
@@ -36,7 +43,6 @@ serde_json = "1.0"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 zero_protocol = { path = "../zero_protocol" }
-
 ```
 
 ## FILE: crates/zero_mesh/src/crypto.rs
@@ -949,7 +955,6 @@ mod tests {
         assert!(!alice.has_peer_session("bob"));
     }
 }
-
 ```
 
 ## FILE: crates/zero_mesh/src/invite.rs
@@ -1435,7 +1440,6 @@ mod tests {
         );
     }
 }
-
 ```
 
 ## FILE: crates/zero_mesh/src/lib.rs
@@ -1463,7 +1467,6 @@ pub use wasm::WasmMeshTopology;
 pub use wasm::*;
 #[allow(unused_imports)]
 pub use webrtc::*;
-
 ```
 
 ## FILE: crates/zero_mesh/src/mesh.rs
@@ -4128,7 +4131,6 @@ mod tests {
         assert_eq!(err, MeshError::PeerNotFound("ghost".to_string()));
     }
 }
-
 ```
 
 ## FILE: crates/zero_mesh/src/wasm.rs
@@ -4283,7 +4285,6 @@ impl WasmMeshTopology {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }
-
 ```
 
 ## FILE: crates/zero_mesh/src/webrtc.rs
@@ -4986,7 +4987,6 @@ impl WasmWebRtcEngine {
         self.peer.close().map_err(Into::into)
     }
 }
-
 ```
 
 ## FILE: crates/zero_mesh/tests/e2e_handshake.rs
@@ -5778,7 +5778,6 @@ fn test_req_005_5_complete_e2e_handshake_and_encrypted_chat_roundtrip() {
         ChatUi::verify_zero_persistence().expect("post-termination persistence audit");
     });
 }
-
 ```
 
 ## FILE: crates/zero_mesh/tests/invite_tests.rs
@@ -6068,7 +6067,6 @@ fn test_req_004_2_fragment_unpacking_and_tamper_rejection() {
         InviteError::MissingPayload
     );
 }
-
 ```
 
 ## FILE: crates/zero_mesh/tests/mesh_simulation_test.rs
@@ -11038,7 +11036,6 @@ fn test_req_031_8_reconcile_higher_id_falls_back_after_grace() {
     assert_eq!(charlie_mesh.open_peers(), 2);
     assert_eq!(bob_mesh.open_peers(), 2);
 }
-
 ```
 
 ## FILE: crates/zero_mesh/tests/webrtc_tests.rs
@@ -11336,7 +11333,6 @@ fn test_bundle_sdp_with_candidates_deduplication_and_crlf() {
     );
     assert!(bundled.ends_with("a=end-of-candidates\r\n"));
 }
-
 ```
 
 ## FILE: crates/zero_protocol/Cargo.toml
@@ -11360,7 +11356,6 @@ serde_json = "1.0"
 sha2 = "0.10"
 x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.8", features = ["derive"] }
-
 ```
 
 ## FILE: crates/zero_protocol/src/crypto.rs
@@ -11735,7 +11730,6 @@ pub use hmac_sha256::{
 };
 pub use uuid::{generate_random_bytes_16, generate_uuid_v4};
 pub use x25519::{derive_shared_secret, X25519Keypair};
-
 ```
 
 ## FILE: crates/zero_protocol/src/envelope.rs
@@ -12218,7 +12212,6 @@ mod tests {
         assert_eq!(empty, decoded_empty);
     }
 }
-
 ```
 
 ## FILE: crates/zero_protocol/src/lib.rs
@@ -12229,7 +12222,6 @@ pub mod crypto;
 pub mod envelope;
 
 pub use envelope::*;
-
 ```
 
 ## FILE: crates/zero_protocol/tests/protocol_tests.rs
@@ -12851,6 +12843,5 @@ fn test_generate_random_bytes_16_and_uuid_v4() {
     let variant_char = parts[3].chars().next().unwrap();
     assert!(matches!(variant_char, '8' | '9' | 'a' | 'b'));
 }
-
 ```
 
