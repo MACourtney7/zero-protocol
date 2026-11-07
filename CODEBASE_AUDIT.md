@@ -4205,6 +4205,20 @@ impl WasmMeshTopology {
         self.topology.has_peer(peer_id)
     }
 
+    /// Removes a peer from the mesh topology and closes its channel.
+    pub fn remove_peer(&self, peer_id: &str) -> Result<(), JsValue> {
+        self.topology
+            .remove_peer(peer_id)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Disconnects a peer from the mesh topology and closes its channel.
+    pub fn disconnect_peer(&self, peer_id: &str) -> Result<(), JsValue> {
+        self.topology
+            .disconnect_peer(peer_id)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Broadcasts a chat message across all connected peers.
     pub fn broadcast_chat(&self, plaintext: &str) -> Result<String, JsValue> {
         self.topology
@@ -4566,6 +4580,8 @@ struct PeerSessionInner {
     text_callbacks: Vec<TextCallback>,
     binary_callbacks: Vec<BinaryCallback>,
     state_callbacks: Vec<StateCallback>,
+    outbound_tx_hook: Option<Rc<dyn Fn(&str)>>,
+    outbound_binary_hook: Option<Rc<dyn Fn(&[u8])>>,
     outbound_queue: Vec<DataChannelMessage>,
     paired_peer: Option<Weak<RefCell<PeerSessionInner>>>,
 }
@@ -4583,6 +4599,8 @@ impl PeerSessionInner {
             text_callbacks: Vec::new(),
             binary_callbacks: Vec::new(),
             state_callbacks: Vec::new(),
+            outbound_tx_hook: None,
+            outbound_binary_hook: None,
             outbound_queue: Vec::new(),
             paired_peer: None,
         }
@@ -4676,6 +4694,16 @@ impl WebRtcPeer {
             .borrow_mut()
             .state_callbacks
             .push(Rc::new(callback));
+    }
+
+    /// Sets an outbound transmission hook invoked whenever text is sent via `send_text`.
+    pub fn set_outbound_tx_hook<F: Fn(&str) + 'static>(&self, hook: F) {
+        self.inner.borrow_mut().outbound_tx_hook = Some(Rc::new(hook));
+    }
+
+    /// Sets an outbound binary transmission hook invoked whenever binary data is sent via `send_binary`.
+    pub fn set_outbound_binary_hook<F: Fn(&[u8]) + 'static>(&self, hook: F) {
+        self.inner.borrow_mut().outbound_binary_hook = Some(Rc::new(hook));
     }
 
     fn set_state_and_notify(
@@ -4786,18 +4814,24 @@ impl WebRtcPeer {
 
     /// Sends a UTF-8 text message over the open data channel.
     pub fn send_text(&self, text: &str) -> Result<(), WebRtcError> {
-        let paired = {
+        let (paired, outbound_hook) = {
             let mut inner = self.inner.borrow_mut();
             if inner.state != PeerLifecycleState::Open {
                 return Err(WebRtcError::ChannelNotOpen(inner.state));
             }
-            inner
-                .outbound_queue
-                .push(DataChannelMessage::Text(text.to_string()));
-            inner.paired_peer.as_ref().and_then(Weak::upgrade)
+            let hook = inner.outbound_tx_hook.clone();
+            if hook.is_none() {
+                inner
+                    .outbound_queue
+                    .push(DataChannelMessage::Text(text.to_string()));
+            }
+            let paired = inner.paired_peer.as_ref().and_then(Weak::upgrade);
+            (paired, hook)
         };
 
-        if let Some(remote_inner) = paired {
+        if let Some(hook) = outbound_hook {
+            hook(text);
+        } else if let Some(remote_inner) = paired {
             let remote_peer = WebRtcPeer {
                 inner: remote_inner,
             };
@@ -4809,18 +4843,24 @@ impl WebRtcPeer {
 
     /// Sends a binary packet over the open data channel.
     pub fn send_binary(&self, bytes: &[u8]) -> Result<(), WebRtcError> {
-        let paired = {
+        let (paired, outbound_hook) = {
             let mut inner = self.inner.borrow_mut();
             if inner.state != PeerLifecycleState::Open {
                 return Err(WebRtcError::ChannelNotOpen(inner.state));
             }
-            inner
-                .outbound_queue
-                .push(DataChannelMessage::Binary(bytes.to_vec()));
-            inner.paired_peer.as_ref().and_then(Weak::upgrade)
+            let hook = inner.outbound_binary_hook.clone();
+            if hook.is_none() {
+                inner
+                    .outbound_queue
+                    .push(DataChannelMessage::Binary(bytes.to_vec()));
+            }
+            let paired = inner.paired_peer.as_ref().and_then(Weak::upgrade);
+            (paired, hook)
         };
 
-        if let Some(remote_inner) = paired {
+        if let Some(hook) = outbound_hook {
+            hook(bytes);
+        } else if let Some(remote_inner) = paired {
             let remote_peer = WebRtcPeer {
                 inner: remote_inner,
             };
@@ -4879,12 +4919,17 @@ impl WebRtcPeer {
         Ok(())
     }
 
-    /// Explicitly transitions the peer state to `Open` for deterministic loopback testing.
-    pub fn mark_open_for_testing(&self) -> Result<(), WebRtcError> {
+    /// Explicitly transitions the peer state to `Open` for WebRTC DataChannel bridging.
+    pub fn mark_open(&self) -> Result<(), WebRtcError> {
         if self.state() != PeerLifecycleState::Open {
             self.set_state_and_notify(PeerLifecycleState::Open)?;
         }
         Ok(())
+    }
+
+    /// Explicitly transitions the peer state to `Open` for deterministic loopback testing.
+    pub fn mark_open_for_testing(&self) -> Result<(), WebRtcError> {
+        self.mark_open()
     }
 }
 
@@ -4984,6 +5029,41 @@ impl WasmWebRtcEngine {
 
     /// Closes the data channel and peer connection.
     pub fn close(&self) -> Result<(), JsValue> {
+        self.peer.close().map_err(Into::into)
+    }
+
+    /// Sets an outbound transmission callback `(text: string) => void` invoked when text is sent.
+    pub fn set_outbound_tx(&self, callback: js_sys::Function) {
+        self.peer.set_outbound_tx_hook(move |text| {
+            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(text));
+        });
+    }
+
+    /// Sets an outbound binary transmission callback `(bytes: Uint8Array) => void` invoked when binary data is sent.
+    pub fn set_outbound_binary_tx(&self, callback: js_sys::Function) {
+        self.peer.set_outbound_binary_hook(move |bytes| {
+            let uint8 = js_sys::Uint8Array::from(bytes);
+            let _ = callback.call1(&JsValue::NULL, &uint8);
+        });
+    }
+
+    /// Injects an incoming text message into this peer's receive pipeline.
+    pub fn inject_incoming_text(&self, text: &str) {
+        self.peer.receive_text(text);
+    }
+
+    /// Injects an incoming binary payload into this peer's receive pipeline.
+    pub fn inject_incoming_binary(&self, bytes: &[u8]) {
+        self.peer.receive_binary(bytes);
+    }
+
+    /// Transitions the peer state to `Open` directly for deterministic bridging/testing.
+    pub fn mark_open(&self) -> Result<(), JsValue> {
+        self.peer.mark_open().map_err(Into::into)
+    }
+
+    /// Transitions the peer state to `Closed` directly.
+    pub fn mark_closed(&self) -> Result<(), JsValue> {
         self.peer.close().map_err(Into::into)
     }
 }
@@ -11333,6 +11413,82 @@ fn test_bundle_sdp_with_candidates_deduplication_and_crlf() {
     );
     assert!(bundled.ends_with("a=end-of-candidates\r\n"));
 }
+
+#[test]
+fn test_webrtc_peer_outbound_tx_hook_and_lifecycle_testing_helpers() {
+    let peer = WebRtcPeer::new();
+    assert_eq!(peer.state(), PeerLifecycleState::Connecting);
+
+    // mark_open_for_testing
+    peer.mark_open_for_testing().expect("mark_open_for_testing");
+    assert_eq!(peer.state(), PeerLifecycleState::Open);
+
+    // register outbound_tx_hook
+    let intercepted = Rc::new(RefCell::new(Vec::new()));
+    let intercepted_clone = intercepted.clone();
+    peer.set_outbound_tx_hook(move |msg| {
+        intercepted_clone.borrow_mut().push(msg.to_string());
+    });
+
+    // send_text triggers the hook
+    peer.send_text("hello bridge").expect("send_text");
+    assert_eq!(*intercepted.borrow(), vec!["hello bridge".to_string()]);
+    // outbound_queue must remain empty when hook is installed (no unbounded memory leak)
+    assert!(peer.outbound_messages().is_empty());
+
+    // test outbound_binary_hook
+    let intercepted_bin = Rc::new(RefCell::new(Vec::new()));
+    let bin_clone = intercepted_bin.clone();
+    peer.set_outbound_binary_hook(move |b| {
+        bin_clone.borrow_mut().push(b.to_vec());
+    });
+    peer.send_binary(b"binary bridge").expect("send_binary");
+    assert_eq!(*intercepted_bin.borrow(), vec![b"binary bridge".to_vec()]);
+    assert!(peer.outbound_messages().is_empty());
+
+    // receive_text dispatches to on_text_message
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let received_clone = received.clone();
+    peer.on_text_message(move |msg| {
+        received_clone.borrow_mut().push(msg.to_string());
+    });
+
+    peer.receive_text("incoming from bridge");
+    assert_eq!(*received.borrow(), vec!["incoming from bridge".to_string()]);
+
+    // close
+    peer.close().expect("close");
+    assert_eq!(peer.state(), PeerLifecycleState::Closed);
+}
+
+#[test]
+fn test_wasm_mesh_topology_remove_peer_and_disconnect_peer() {
+    use zero_mesh::{WasmMeshTopology, WasmWebRtcEngine};
+
+    let secret = [42u8; 32];
+    let top = WasmMeshTopology::new("alice", &secret).expect("new topology");
+    let peer_engine = WasmWebRtcEngine::new();
+    peer_engine.mark_open().expect("mark_open");
+    let peer_pub = [99u8; 32];
+    top.register_peer("bob", &peer_pub, &peer_engine).expect("register bob");
+    assert_eq!(top.peer_count(), 1);
+    assert!(top.has_peer("bob"));
+
+    // remove_peer closes channel and purges immediately
+    top.remove_peer("bob").expect("remove_peer");
+    assert_eq!(top.peer_count(), 0);
+    assert!(!top.has_peer("bob"));
+
+    // register fresh peer and test disconnect_peer
+    let charlie_engine = WasmWebRtcEngine::new();
+    charlie_engine.mark_open().expect("mark_open charlie");
+    top.register_peer("charlie", &peer_pub, &charlie_engine).expect("register charlie");
+    assert_eq!(top.peer_count(), 1);
+    assert!(top.has_peer("charlie"));
+    top.disconnect_peer("charlie").expect("disconnect charlie");
+    assert_eq!(top.peer_count(), 0);
+    assert!(!top.has_peer("charlie"));
+}
 ```
 
 ## FILE: crates/zero_protocol/Cargo.toml
@@ -12276,6 +12432,56 @@ fn test_invite_payload_roundtrip_serialization() {
     let decoded_bytes: InvitePayload =
         from_json_bytes(&json_bytes).expect("deserialize from JSON bytes");
     assert_eq!(payload, decoded_bytes);
+}
+
+#[test]
+fn test_browser_js_invite_and_drop_payload_serde_wire_compatibility() {
+    // 1. Exact JSON string shape produced by ZeroMeshNetworkManager._stageNewInvite in zero_mesh_network.js
+    let js_staged_invite_json = r#"{
+        "do_id": "clifton-commons",
+        "invite_uuid": "inv-walker-123-abc",
+        "token": "a1b2c3d4e5f6",
+        "sdp_offer": { "sdp": "v=0\r\no=FakeOffer\r\n" },
+        "host_public_key": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32],
+        "guest_private_key": null,
+        "host_peer_id": "walker-123",
+        "assigned_peer_id": "peer-abc",
+        "host_signing_key": [32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1]
+    }"#;
+
+    let invite: InvitePayload = from_json_str(js_staged_invite_json)
+        .expect("JS _stageNewInvite JSON must cleanly deserialize into InvitePayload without 400");
+    assert_eq!(invite.do_id, "clifton-commons");
+    assert_eq!(invite.invite_uuid, "inv-walker-123-abc");
+    assert_eq!(invite.token, "a1b2c3d4e5f6");
+    assert_eq!(invite.sdp_offer.sdp, "v=0\r\no=FakeOffer\r\n");
+    assert_eq!(invite.guest_private_key, None);
+    assert_eq!(invite.host_peer_id, Some("walker-123".to_string()));
+    assert_eq!(invite.assigned_peer_id, Some("peer-abc".to_string()));
+
+    // 2. Exact JSON string shape produced by ZeroMeshNetworkManager._connectLiveMesh in zero_mesh_network.js
+    let js_drop_payload_json = r#"{
+        "invite_uuid": "inv-walker-123-abc",
+        "token": "a1b2c3d4e5f6",
+        "sdp_answer": { "sdp": "SEALED" },
+        "joiner_public_key": [2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33],
+        "joiner_peer_id": "peer-abc",
+        "joiner_signing_key": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32],
+        "sealed_sdp_answer": {
+            "ciphertext": [10, 20, 30],
+            "nonce": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        },
+        "signature": null
+    }"#;
+
+    let drop: DropPayload = from_json_str(js_drop_payload_json)
+        .expect("JS _connectLiveMesh dropPayload JSON must cleanly deserialize into DropPayload without 400");
+    assert_eq!(drop.invite_uuid, "inv-walker-123-abc");
+    assert_eq!(drop.token, "a1b2c3d4e5f6");
+    assert_eq!(drop.sdp_answer.sdp, "SEALED");
+    assert_eq!(drop.joiner_peer_id, Some("peer-abc".to_string()));
+    assert_eq!(drop.signature, None);
+    assert!(drop.sealed_sdp_answer.is_some());
 }
 
 #[test]
