@@ -291,3 +291,38 @@ fn test_bundle_sdp_with_candidates_deduplication_and_crlf() {
     );
     assert!(bundled.ends_with("a=end-of-candidates\r\n"));
 }
+
+#[test]
+fn test_webrtc_peer_outbound_tx_hook_and_lifecycle_testing_helpers() {
+    let peer = WebRtcPeer::new();
+    assert_eq!(peer.state(), PeerLifecycleState::Connecting);
+
+    // mark_open_for_testing
+    peer.mark_open_for_testing().expect("mark_open_for_testing");
+    assert_eq!(peer.state(), PeerLifecycleState::Open);
+
+    // register outbound_tx_hook
+    let intercepted = Rc::new(RefCell::new(Vec::new()));
+    let intercepted_clone = intercepted.clone();
+    peer.set_outbound_tx_hook(move |msg| {
+        intercepted_clone.borrow_mut().push(msg.to_string());
+    });
+
+    // send_text triggers the hook
+    peer.send_text("hello bridge").expect("send_text");
+    assert_eq!(*intercepted.borrow(), vec!["hello bridge".to_string()]);
+
+    // receive_text dispatches to on_text_message
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let received_clone = received.clone();
+    peer.on_text_message(move |msg| {
+        received_clone.borrow_mut().push(msg.to_string());
+    });
+
+    peer.receive_text("incoming from bridge");
+    assert_eq!(*received.borrow(), vec!["incoming from bridge".to_string()]);
+
+    // close
+    peer.close().expect("close");
+    assert_eq!(peer.state(), PeerLifecycleState::Closed);
+}
