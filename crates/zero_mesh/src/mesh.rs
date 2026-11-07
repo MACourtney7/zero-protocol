@@ -153,6 +153,9 @@ struct MeshTopologyInner {
     seen_messages: HashSet<String>,
     seen_message_order: Vec<String>,
     max_seen_cache: usize,
+    /// Per-peer monotonic sequence numbers (vector-clock style counters) keyed by peer ID.
+    /// The entry for `local_peer_id` is migrated when the local identity is reassigned.
+    sequence_numbers: HashMap<String, u64>,
     has_burned: bool,
     on_message_callbacks: Vec<MessageCallback>,
     on_state_callbacks: Vec<StateCallback>,
@@ -183,6 +186,7 @@ impl MeshTopology {
                 seen_messages: HashSet::new(),
                 seen_message_order: Vec::new(),
                 max_seen_cache: 1024,
+                sequence_numbers: HashMap::new(),
                 has_burned: false,
                 on_message_callbacks: Vec::new(),
                 on_state_callbacks: Vec::new(),
@@ -204,8 +208,41 @@ impl MeshTopology {
     ///
     /// The X25519 private scalar is preserved, so shared-secret derivation with
     /// already-registered peers remains valid (unification-016).
+    ///
+    /// Any state keyed by the previous local peer ID (e.g. vector-clock style
+    /// sequence numbers) is migrated to the new ID so history is preserved.
     pub fn set_local_peer_id(&self, peer_id: &str) {
-        self.inner.borrow_mut().local_peer_id = peer_id.to_string();
+        let mut inner = self.inner.borrow_mut();
+        let old_id = inner.local_peer_id.clone();
+        if old_id == peer_id {
+            return;
+        }
+
+        // Migrate local-ID-keyed sequence numbers (vector clock counters).
+        if let Some(seq) = inner.sequence_numbers.remove(&old_id) {
+            let entry = inner
+                .sequence_numbers
+                .entry(peer_id.to_string())
+                .or_insert(0);
+            if seq > *entry {
+                *entry = seq;
+            }
+        }
+
+        inner.local_peer_id = peer_id.to_string();
+    }
+
+    /// Returns the current sequence number (vector-clock counter) for `peer_id`, if any.
+    pub fn sequence_number(&self, peer_id: &str) -> Option<u64> {
+        self.inner.borrow().sequence_numbers.get(peer_id).copied()
+    }
+
+    /// Sets the sequence number (vector-clock counter) for `peer_id`.
+    pub fn set_sequence_number(&self, peer_id: &str, seq: u64) {
+        self.inner
+            .borrow_mut()
+            .sequence_numbers
+            .insert(peer_id.to_string(), seq);
     }
 
     /// Returns the local X25519 public key.
