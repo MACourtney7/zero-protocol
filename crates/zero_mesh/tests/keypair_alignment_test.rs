@@ -33,8 +33,7 @@ fn test_mismatched_keypair_fails_aead() {
     assert_eq!(opened, b"top secret payload");
 
     // Bob (mis-registered) opens using a mismatched public key: must fail AEAD.
-    let mismatched_crypto =
-        ChatSessionCrypto::from_keypair_and_peer_public(&bob_sk, &mallory_pk);
+    let mismatched_crypto = ChatSessionCrypto::from_keypair_and_peer_public(&bob_sk, &mallory_pk);
     let err = mismatched_crypto.open_raw(&sealed);
     assert!(
         err.is_err(),

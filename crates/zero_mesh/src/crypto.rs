@@ -254,7 +254,8 @@ impl WasmCryptoSession {
         private_key.copy_from_slice(bytes);
 
         let x25519 = x25519::X25519Keypair::from_private_key(private_key);
-        let ed25519 = zero_protocol::crypto::ed25519::Ed25519Keypair::generate().map_err(js_error)?;
+        let ed25519 =
+            zero_protocol::crypto::ed25519::Ed25519Keypair::generate().map_err(js_error)?;
 
         Ok(WasmCryptoSession {
             bundle: BurnerKeybundle { x25519, ed25519 },
@@ -970,7 +971,9 @@ mod tests {
 
         // Reverse direction.
         let sealed_back = bob.seal_for_peer("alice", msg).expect("seal back");
-        let opened_back = alice.open_from_peer("bob", &sealed_back).expect("open back");
+        let opened_back = alice
+            .open_from_peer("bob", &sealed_back)
+            .expect("open back");
         assert_eq!(opened_back, msg);
     }
 
