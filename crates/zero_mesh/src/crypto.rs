@@ -452,8 +452,22 @@ impl WasmCryptoSession {
     }
 
     /// Computes HMAC-SHA256 hex string token for invite authentication.
+    ///
+    /// Accepts either raw secret bytes or a 64-character hex string encoding of the
+    /// secret. When `secret` is exactly 64 ASCII hex digits, it is decoded to raw
+    /// bytes before computing the HMAC so both representations yield identical tokens.
     pub fn compute_hmac_hex(secret: &[u8], invite_uuid: &str) -> Result<String, JsValue> {
-        zero_protocol::crypto::hmac_sha256::compute_invite_token(secret, invite_uuid)
+        let key_bytes: Vec<u8> =
+            if secret.len() == 64 && secret.iter().all(|b| b.is_ascii_hexdigit()) {
+                if let Ok(s) = std::str::from_utf8(secret) {
+                    hex::decode(s).map_err(js_error)?
+                } else {
+                    return Err(js_error("Invalid UTF-8 in hex secret"));
+                }
+            } else {
+                secret.to_vec()
+            };
+        zero_protocol::crypto::hmac_sha256::compute_invite_token(&key_bytes, invite_uuid)
             .map(|token| token.hmac_hex)
             .map_err(js_error)
     }
@@ -920,6 +934,39 @@ mod tests {
         let expected =
             zero_protocol::crypto::hmac_sha256::compute_invite_token(secret, uuid).unwrap();
         assert_eq!(token, expected.hmac_hex);
+    }
+
+    #[test]
+    fn test_wasm_crypto_session_compute_hmac_hex_accepts_raw_and_hex() {
+        let raw_secret: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let hex_secret = hex::encode(raw_secret);
+        assert_eq!(hex_secret.len(), 64);
+
+        let uuid = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+
+        let token_from_raw =
+            WasmCryptoSession::compute_hmac_hex(&raw_secret, uuid).expect("raw hmac");
+        let token_from_hex =
+            WasmCryptoSession::compute_hmac_hex(hex_secret.as_bytes(), uuid).expect("hex hmac");
+
+        assert_eq!(token_from_raw, token_from_hex);
+        assert_eq!(token_from_raw.len(), 64);
+
+        // Matches the direct protocol computation over the raw bytes.
+        let expected =
+            zero_protocol::crypto::hmac_sha256::compute_invite_token(&raw_secret, uuid).unwrap();
+        assert_eq!(token_from_raw, expected.hmac_hex);
+
+        // Empty secret is rejected.
+        assert!(WasmCryptoSession::compute_hmac_hex(&[], uuid).is_err());
+
+        // A 64-byte non-hex secret is treated as raw bytes (not decoded) and still succeeds.
+        let non_hex_64 = vec![b'z'; 64];
+        assert!(WasmCryptoSession::compute_hmac_hex(&non_hex_64, uuid).is_ok());
     }
 
     #[test]
