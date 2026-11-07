@@ -199,6 +199,15 @@ impl MeshTopology {
         self.inner.borrow().local_peer_id.clone()
     }
 
+    /// Reassigns the local peer identity (e.g. from a bootstrap `walker-*` ID to the
+    /// server-assigned `peer-*` ID) without invalidating registered peers or vector clocks.
+    ///
+    /// The X25519 private scalar is preserved, so shared-secret derivation with
+    /// already-registered peers remains valid (unification-016).
+    pub fn set_local_peer_id(&self, peer_id: &str) {
+        self.inner.borrow_mut().local_peer_id = peer_id.to_string();
+    }
+
     /// Returns the local X25519 public key.
     pub fn local_public_key(&self) -> [u8; 32] {
         self.inner.borrow().local_public_key
@@ -2274,6 +2283,29 @@ mod tests {
         assert_eq!(alice_mesh.seen_messages_count(), 0);
         assert_eq!(bob_mesh.seen_messages_count(), 0);
         assert_eq!(charlie_mesh.seen_messages_count(), 0);
+    }
+
+    #[test]
+    fn test_set_local_peer_id_preserves_peers() {
+        let (alice_sk, _alice_pk) = generate_kp();
+        let alice_mesh = MeshTopology::new("walker-bootstrap", alice_sk);
+
+        let (_bob_sk, bob_pk) = generate_kp();
+        let bob_peer = WebRtcPeer::new();
+        bob_peer.mark_open_for_testing().unwrap();
+        alice_mesh
+            .add_peer("bob", bob_pk, bob_peer)
+            .expect("add bob");
+
+        assert_eq!(alice_mesh.local_peer_id(), "walker-bootstrap");
+        assert!(alice_mesh.has_peer("bob"));
+
+        alice_mesh.set_local_peer_id("peer-xyz");
+
+        assert_eq!(alice_mesh.local_peer_id(), "peer-xyz");
+        assert!(alice_mesh.has_peer("bob"));
+        assert_eq!(alice_mesh.peer_count(), 1);
+        assert_eq!(alice_mesh.connected_peers(), vec!["bob".to_string()]);
     }
 
     #[test]
