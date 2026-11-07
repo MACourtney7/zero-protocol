@@ -287,7 +287,36 @@ impl WasmCryptoSession {
         })
     }
 
-    /// Returns the 32-byte X25519 public key bytes.
+    /// Creates a `WasmCryptoSession` from an explicit 32-byte X25519 private key scalar.
+    ///
+    /// The X25519 public key is derived from the supplied scalar. A fresh Ed25519
+    /// signing keypair is generated for message authentication.
+    pub fn from_private_key(bytes: &[u8]) -> Result<WasmCryptoSession, JsValue> {
+        if bytes.len() != KEY_LEN {
+            return Err(js_error(format!(
+                "Invalid private key length: expected {}, got {}",
+                KEY_LEN,
+                bytes.len()
+            )));
+        }
+        let mut private_key = [0u8; KEY_LEN];
+        private_key.copy_from_slice(bytes);
+
+        let x25519 = x25519::X25519Keypair::from_private_key(private_key);
+        let ed25519 = zero_protocol::crypto::ed25519::Ed25519Keypair::generate().map_err(js_error)?;
+
+        Ok(WasmCryptoSession {
+            bundle: BurnerKeybundle { x25519, ed25519 },
+            peer_sessions: HashMap::new(),
+        })
+    }
+
+    /// Returns the 32-byte X25519 private key scalar.
+    pub fn private_key_bytes(&self) -> Vec<u8> {
+        self.bundle.x25519.private_key_bytes().to_vec()
+    }
+
+    /// Returns the 32-byte X25519 public key bytes matching the private scalar.
     pub fn x25519_public_key_bytes(&self) -> Vec<u8> {
         self.bundle.x25519_public_key().to_vec()
     }
@@ -939,6 +968,59 @@ mod tests {
         let expected =
             zero_protocol::crypto::hmac_sha256::compute_invite_token(secret, uuid).unwrap();
         assert_eq!(token, expected.hmac_hex);
+    }
+
+    #[test]
+    fn test_wasm_crypto_session_from_private_key_roundtrip() {
+        let scalar = [0x42u8; KEY_LEN];
+        let session = WasmCryptoSession::from_private_key(&scalar).expect("from private key");
+
+        // Private key roundtrips exactly.
+        assert_eq!(session.private_key_bytes(), scalar.to_vec());
+
+        // Public key matches the one derived from the same scalar.
+        let expected = x25519::X25519Keypair::from_private_key(scalar);
+        assert_eq!(
+            session.x25519_public_key_bytes(),
+            expected.public_key_bytes().to_vec()
+        );
+
+        // Invalid lengths are rejected.
+        assert!(WasmCryptoSession::from_private_key(&[0u8; 16]).is_err());
+        assert!(WasmCryptoSession::from_private_key(&[0u8; 33]).is_err());
+    }
+
+    #[test]
+    fn test_wasm_crypto_session_from_private_key_exchange() {
+        let alice_scalar = [0x11u8; KEY_LEN];
+        let bob_scalar = [0x22u8; KEY_LEN];
+
+        let mut alice = WasmCryptoSession::from_private_key(&alice_scalar).expect("alice");
+        let mut bob = WasmCryptoSession::from_private_key(&bob_scalar).expect("bob");
+
+        alice
+            .register_peer(
+                "bob",
+                &bob.x25519_public_key_bytes(),
+                Some(bob.ed25519_public_key_bytes()),
+            )
+            .expect("register bob on alice");
+        bob.register_peer(
+            "alice",
+            &alice.x25519_public_key_bytes(),
+            Some(alice.ed25519_public_key_bytes()),
+        )
+        .expect("register alice on bob");
+
+        let msg = b"Deterministic keypair exchange payload";
+        let sealed = alice.seal_for_peer("bob", msg).expect("seal");
+        let opened = bob.open_from_peer("alice", &sealed).expect("open");
+        assert_eq!(opened, msg);
+
+        // Reverse direction.
+        let sealed_back = bob.seal_for_peer("alice", msg).expect("seal back");
+        let opened_back = alice.open_from_peer("bob", &sealed_back).expect("open back");
+        assert_eq!(opened_back, msg);
     }
 
     #[test]
@@ -1626,6 +1708,9 @@ struct MeshTopologyInner {
     seen_messages: HashSet<String>,
     seen_message_order: Vec<String>,
     max_seen_cache: usize,
+    /// Per-peer monotonic sequence numbers (vector-clock style counters) keyed by peer ID.
+    /// The entry for `local_peer_id` is migrated when the local identity is reassigned.
+    sequence_numbers: HashMap<String, u64>,
     has_burned: bool,
     on_message_callbacks: Vec<MessageCallback>,
     on_state_callbacks: Vec<StateCallback>,
@@ -1656,6 +1741,7 @@ impl MeshTopology {
                 seen_messages: HashSet::new(),
                 seen_message_order: Vec::new(),
                 max_seen_cache: 1024,
+                sequence_numbers: HashMap::new(),
                 has_burned: false,
                 on_message_callbacks: Vec::new(),
                 on_state_callbacks: Vec::new(),
@@ -1670,6 +1756,48 @@ impl MeshTopology {
     /// Returns the local peer identifier.
     pub fn local_peer_id(&self) -> String {
         self.inner.borrow().local_peer_id.clone()
+    }
+
+    /// Reassigns the local peer identity (e.g. from a bootstrap `walker-*` ID to the
+    /// server-assigned `peer-*` ID) without invalidating registered peers or vector clocks.
+    ///
+    /// The X25519 private scalar is preserved, so shared-secret derivation with
+    /// already-registered peers remains valid (unification-016).
+    ///
+    /// Any state keyed by the previous local peer ID (e.g. vector-clock style
+    /// sequence numbers) is migrated to the new ID so history is preserved.
+    pub fn set_local_peer_id(&self, peer_id: &str) {
+        let mut inner = self.inner.borrow_mut();
+        let old_id = inner.local_peer_id.clone();
+        if old_id == peer_id {
+            return;
+        }
+
+        // Migrate local-ID-keyed sequence numbers (vector clock counters).
+        if let Some(seq) = inner.sequence_numbers.remove(&old_id) {
+            let entry = inner
+                .sequence_numbers
+                .entry(peer_id.to_string())
+                .or_insert(0);
+            if seq > *entry {
+                *entry = seq;
+            }
+        }
+
+        inner.local_peer_id = peer_id.to_string();
+    }
+
+    /// Returns the current sequence number (vector-clock counter) for `peer_id`, if any.
+    pub fn sequence_number(&self, peer_id: &str) -> Option<u64> {
+        self.inner.borrow().sequence_numbers.get(peer_id).copied()
+    }
+
+    /// Sets the sequence number (vector-clock counter) for `peer_id`.
+    pub fn set_sequence_number(&self, peer_id: &str, seq: u64) {
+        self.inner
+            .borrow_mut()
+            .sequence_numbers
+            .insert(peer_id.to_string(), seq);
     }
 
     /// Returns the local X25519 public key.
@@ -3750,6 +3878,29 @@ mod tests {
     }
 
     #[test]
+    fn test_set_local_peer_id_preserves_peers() {
+        let (alice_sk, _alice_pk) = generate_kp();
+        let alice_mesh = MeshTopology::new("walker-bootstrap", alice_sk);
+
+        let (_bob_sk, bob_pk) = generate_kp();
+        let bob_peer = WebRtcPeer::new();
+        bob_peer.mark_open_for_testing().unwrap();
+        alice_mesh
+            .add_peer("bob", bob_pk, bob_peer)
+            .expect("add bob");
+
+        assert_eq!(alice_mesh.local_peer_id(), "walker-bootstrap");
+        assert!(alice_mesh.has_peer("bob"));
+
+        alice_mesh.set_local_peer_id("peer-xyz");
+
+        assert_eq!(alice_mesh.local_peer_id(), "peer-xyz");
+        assert!(alice_mesh.has_peer("bob"));
+        assert_eq!(alice_mesh.peer_count(), 1);
+        assert_eq!(alice_mesh.connected_peers(), vec!["bob".to_string()]);
+    }
+
+    #[test]
     fn test_mesh_topology_manager_alias() {
         let (alice_sk, _alice_pk) = generate_kp();
         let mgr: MeshTopologyManager = MeshTopology::new("alice", alice_sk);
@@ -4169,6 +4320,12 @@ impl WasmMeshTopology {
     /// Returns the local peer identifier.
     pub fn local_peer_id(&self) -> String {
         self.topology.local_peer_id()
+    }
+
+    /// Updates the local peer identifier while preserving all registered peers
+    /// and vector clocks (unification-016).
+    pub fn set_local_peer_id(&self, new_peer_id: String) {
+        self.topology.set_local_peer_id(&new_peer_id);
     }
 
     /// Returns the 32-byte local public key.
@@ -6146,6 +6303,103 @@ fn test_req_004_2_fragment_unpacking_and_tamper_rejection() {
         unpack_invite_fragment("").unwrap_err(),
         InviteError::MissingPayload
     );
+}
+```
+
+## FILE: crates/zero_mesh/tests/keypair_alignment_test.rs
+```rust
+//! Keypair alignment and negative AEAD control tests (unification-016).
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use zero_mesh::crypto::ChatSessionCrypto;
+use zero_mesh::mesh::MeshTopology;
+use zero_mesh::webrtc::WebRtcPeer;
+use zero_protocol::crypto::x25519::X25519Keypair;
+
+fn generate_kp() -> ([u8; 32], [u8; 32]) {
+    let kp = X25519Keypair::generate().expect("keypair");
+    (*kp.private_key_bytes(), *kp.public_key_bytes())
+}
+
+/// Negative control: sealing with one shared secret and opening with a
+/// mismatched (third-party) public key must fail AEAD authentication.
+#[test]
+fn test_mismatched_keypair_fails_aead() {
+    let (alice_sk, alice_pk) = generate_kp();
+    let (bob_sk, bob_pk) = generate_kp();
+    let (_mallory_sk, mallory_pk) = generate_kp();
+
+    // Alice seals using the correct Alice<->Bob shared secret.
+    let alice_crypto = ChatSessionCrypto::from_keypair_and_peer_public(&alice_sk, &bob_pk);
+    let sealed = alice_crypto
+        .seal_raw(b"top secret payload")
+        .expect("seal succeeds");
+
+    // Bob opens using the correct shared secret: succeeds.
+    let bob_crypto = ChatSessionCrypto::from_keypair_and_peer_public(&bob_sk, &alice_pk);
+    let opened = bob_crypto.open_raw(&sealed).expect("correct key opens");
+    assert_eq!(opened, b"top secret payload");
+
+    // Bob (mis-registered) opens using a mismatched public key: must fail AEAD.
+    let mismatched_crypto =
+        ChatSessionCrypto::from_keypair_and_peer_public(&bob_sk, &mallory_pk);
+    let err = mismatched_crypto.open_raw(&sealed);
+    assert!(
+        err.is_err(),
+        "AEAD open must fail when the peer public key is mismatched"
+    );
+}
+
+/// `set_local_peer_id` must preserve registered peers and migrate
+/// local-ID-keyed vector-clock state to the new identity.
+#[test]
+fn test_set_local_peer_id_preserves_state() {
+    let (alice_sk, _alice_pk) = generate_kp();
+    let mesh = MeshTopology::new("walker-bootstrap", alice_sk);
+
+    // Register a peer.
+    let (_bob_sk, bob_pk) = generate_kp();
+    let bob_peer = WebRtcPeer::new();
+    bob_peer.mark_open_for_testing().unwrap();
+    mesh.add_peer("bob", bob_pk, bob_peer).expect("add bob");
+
+    // Record a vector-clock style sequence number under the old local ID.
+    mesh.set_sequence_number("walker-bootstrap", 42);
+    assert_eq!(mesh.sequence_number("walker-bootstrap"), Some(42));
+
+    // Reassign local identity.
+    mesh.set_local_peer_id("peer-xyz");
+
+    // Peer registration preserved.
+    assert_eq!(mesh.local_peer_id(), "peer-xyz");
+    assert!(mesh.has_peer("bob"));
+    assert_eq!(mesh.peer_count(), 1);
+
+    // Vector-clock state migrated to the new ID.
+    assert_eq!(mesh.sequence_number("peer-xyz"), Some(42));
+    assert_eq!(mesh.sequence_number("walker-bootstrap"), None);
+}
+
+/// Callbacks registered before `set_local_peer_id` remain functional afterwards.
+#[test]
+fn test_set_local_peer_id_preserves_callbacks() {
+    let (alice_sk, _alice_pk) = generate_kp();
+    let mesh = MeshTopology::new("walker-bootstrap", alice_sk);
+
+    let joined = Rc::new(RefCell::new(Vec::new()));
+    let j = joined.clone();
+    mesh.on_peer_joined(move |id| j.borrow_mut().push(id.to_string()));
+
+    mesh.set_local_peer_id("peer-xyz");
+
+    let (_bob_sk, bob_pk) = generate_kp();
+    let bob_peer = WebRtcPeer::new();
+    bob_peer.mark_open_for_testing().unwrap();
+    mesh.add_peer("bob", bob_pk, bob_peer).expect("add bob");
+
+    assert_eq!(*joined.borrow(), vec!["bob".to_string()]);
 }
 ```
 
