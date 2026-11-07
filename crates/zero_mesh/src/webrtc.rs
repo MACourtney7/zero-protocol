@@ -614,12 +614,17 @@ impl WebRtcPeer {
         Ok(())
     }
 
-    /// Explicitly transitions the peer state to `Open` for deterministic loopback testing.
-    pub fn mark_open_for_testing(&self) -> Result<(), WebRtcError> {
+    /// Explicitly transitions the peer state to `Open` for WebRTC DataChannel bridging.
+    pub fn mark_open(&self) -> Result<(), WebRtcError> {
         if self.state() != PeerLifecycleState::Open {
             self.set_state_and_notify(PeerLifecycleState::Open)?;
         }
         Ok(())
+    }
+
+    /// Explicitly transitions the peer state to `Open` for deterministic loopback testing.
+    pub fn mark_open_for_testing(&self) -> Result<(), WebRtcError> {
+        self.mark_open()
     }
 }
 
@@ -749,7 +754,7 @@ impl WasmWebRtcEngine {
 
     /// Transitions the peer state to `Open` directly for deterministic bridging/testing.
     pub fn mark_open(&self) -> Result<(), JsValue> {
-        self.peer.mark_open_for_testing().map_err(Into::into)
+        self.peer.mark_open().map_err(Into::into)
     }
 
     /// Transitions the peer state to `Closed` directly.

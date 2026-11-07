@@ -338,3 +338,32 @@ fn test_webrtc_peer_outbound_tx_hook_and_lifecycle_testing_helpers() {
     peer.close().expect("close");
     assert_eq!(peer.state(), PeerLifecycleState::Closed);
 }
+
+#[test]
+fn test_wasm_mesh_topology_remove_peer_and_disconnect_peer() {
+    use zero_mesh::{WasmMeshTopology, WasmWebRtcEngine};
+
+    let secret = [42u8; 32];
+    let top = WasmMeshTopology::new("alice", &secret).expect("new topology");
+    let peer_engine = WasmWebRtcEngine::new();
+    peer_engine.mark_open().expect("mark_open");
+    let peer_pub = [99u8; 32];
+    top.register_peer("bob", &peer_pub, &peer_engine).expect("register bob");
+    assert_eq!(top.peer_count(), 1);
+    assert!(top.has_peer("bob"));
+
+    // remove_peer closes channel and purges immediately
+    top.remove_peer("bob").expect("remove_peer");
+    assert_eq!(top.peer_count(), 0);
+    assert!(!top.has_peer("bob"));
+
+    // register fresh peer and test disconnect_peer
+    let charlie_engine = WasmWebRtcEngine::new();
+    charlie_engine.mark_open().expect("mark_open charlie");
+    top.register_peer("charlie", &peer_pub, &charlie_engine).expect("register charlie");
+    assert_eq!(top.peer_count(), 1);
+    assert!(top.has_peer("charlie"));
+    top.disconnect_peer("charlie").expect("disconnect charlie");
+    assert_eq!(top.peer_count(), 0);
+    assert!(!top.has_peer("charlie"));
+}
