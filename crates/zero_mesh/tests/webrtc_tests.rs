@@ -311,6 +311,18 @@ fn test_webrtc_peer_outbound_tx_hook_and_lifecycle_testing_helpers() {
     // send_text triggers the hook
     peer.send_text("hello bridge").expect("send_text");
     assert_eq!(*intercepted.borrow(), vec!["hello bridge".to_string()]);
+    // outbound_queue must remain empty when hook is installed (no unbounded memory leak)
+    assert!(peer.outbound_messages().is_empty());
+
+    // test outbound_binary_hook
+    let intercepted_bin = Rc::new(RefCell::new(Vec::new()));
+    let bin_clone = intercepted_bin.clone();
+    peer.set_outbound_binary_hook(move |b| {
+        bin_clone.borrow_mut().push(b.to_vec());
+    });
+    peer.send_binary(b"binary bridge").expect("send_binary");
+    assert_eq!(*intercepted_bin.borrow(), vec![b"binary bridge".to_vec()]);
+    assert!(peer.outbound_messages().is_empty());
 
     // receive_text dispatches to on_text_message
     let received = Rc::new(RefCell::new(Vec::new()));

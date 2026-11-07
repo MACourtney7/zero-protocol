@@ -276,6 +276,7 @@ struct PeerSessionInner {
     binary_callbacks: Vec<BinaryCallback>,
     state_callbacks: Vec<StateCallback>,
     outbound_tx_hook: Option<Rc<dyn Fn(&str)>>,
+    outbound_binary_hook: Option<Rc<dyn Fn(&[u8])>>,
     outbound_queue: Vec<DataChannelMessage>,
     paired_peer: Option<Weak<RefCell<PeerSessionInner>>>,
 }
@@ -294,6 +295,7 @@ impl PeerSessionInner {
             binary_callbacks: Vec::new(),
             state_callbacks: Vec::new(),
             outbound_tx_hook: None,
+            outbound_binary_hook: None,
             outbound_queue: Vec::new(),
             paired_peer: None,
         }
@@ -392,6 +394,11 @@ impl WebRtcPeer {
     /// Sets an outbound transmission hook invoked whenever text is sent via `send_text`.
     pub fn set_outbound_tx_hook<F: Fn(&str) + 'static>(&self, hook: F) {
         self.inner.borrow_mut().outbound_tx_hook = Some(Rc::new(hook));
+    }
+
+    /// Sets an outbound binary transmission hook invoked whenever binary data is sent via `send_binary`.
+    pub fn set_outbound_binary_hook<F: Fn(&[u8]) + 'static>(&self, hook: F) {
+        self.inner.borrow_mut().outbound_binary_hook = Some(Rc::new(hook));
     }
 
     fn set_state_and_notify(
@@ -507,19 +514,19 @@ impl WebRtcPeer {
             if inner.state != PeerLifecycleState::Open {
                 return Err(WebRtcError::ChannelNotOpen(inner.state));
             }
-            inner
-                .outbound_queue
-                .push(DataChannelMessage::Text(text.to_string()));
-            let paired = inner.paired_peer.as_ref().and_then(Weak::upgrade);
             let hook = inner.outbound_tx_hook.clone();
+            if hook.is_none() {
+                inner
+                    .outbound_queue
+                    .push(DataChannelMessage::Text(text.to_string()));
+            }
+            let paired = inner.paired_peer.as_ref().and_then(Weak::upgrade);
             (paired, hook)
         };
 
         if let Some(hook) = outbound_hook {
             hook(text);
-        }
-
-        if let Some(remote_inner) = paired {
+        } else if let Some(remote_inner) = paired {
             let remote_peer = WebRtcPeer {
                 inner: remote_inner,
             };
@@ -531,18 +538,24 @@ impl WebRtcPeer {
 
     /// Sends a binary packet over the open data channel.
     pub fn send_binary(&self, bytes: &[u8]) -> Result<(), WebRtcError> {
-        let paired = {
+        let (paired, outbound_hook) = {
             let mut inner = self.inner.borrow_mut();
             if inner.state != PeerLifecycleState::Open {
                 return Err(WebRtcError::ChannelNotOpen(inner.state));
             }
-            inner
-                .outbound_queue
-                .push(DataChannelMessage::Binary(bytes.to_vec()));
-            inner.paired_peer.as_ref().and_then(Weak::upgrade)
+            let hook = inner.outbound_binary_hook.clone();
+            if hook.is_none() {
+                inner
+                    .outbound_queue
+                    .push(DataChannelMessage::Binary(bytes.to_vec()));
+            }
+            let paired = inner.paired_peer.as_ref().and_then(Weak::upgrade);
+            (paired, hook)
         };
 
-        if let Some(remote_inner) = paired {
+        if let Some(hook) = outbound_hook {
+            hook(bytes);
+        } else if let Some(remote_inner) = paired {
             let remote_peer = WebRtcPeer {
                 inner: remote_inner,
             };
@@ -716,9 +729,22 @@ impl WasmWebRtcEngine {
         });
     }
 
+    /// Sets an outbound binary transmission callback `(bytes: Uint8Array) => void` invoked when binary data is sent.
+    pub fn set_outbound_binary_tx(&self, callback: js_sys::Function) {
+        self.peer.set_outbound_binary_hook(move |bytes| {
+            let uint8 = js_sys::Uint8Array::from(bytes);
+            let _ = callback.call1(&JsValue::NULL, &uint8);
+        });
+    }
+
     /// Injects an incoming text message into this peer's receive pipeline.
     pub fn inject_incoming_text(&self, text: &str) {
         self.peer.receive_text(text);
+    }
+
+    /// Injects an incoming binary payload into this peer's receive pipeline.
+    pub fn inject_incoming_binary(&self, bytes: &[u8]) {
+        self.peer.receive_binary(bytes);
     }
 
     /// Transitions the peer state to `Open` directly for deterministic bridging/testing.

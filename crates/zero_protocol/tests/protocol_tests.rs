@@ -51,6 +51,56 @@ fn test_invite_payload_roundtrip_serialization() {
 }
 
 #[test]
+fn test_browser_js_invite_and_drop_payload_serde_wire_compatibility() {
+    // 1. Exact JSON string shape produced by ZeroMeshNetworkManager._stageNewInvite in zero_mesh_network.js
+    let js_staged_invite_json = r#"{
+        "do_id": "clifton-commons",
+        "invite_uuid": "inv-walker-123-abc",
+        "token": "a1b2c3d4e5f6",
+        "sdp_offer": { "sdp": "v=0\r\no=FakeOffer\r\n" },
+        "host_public_key": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32],
+        "guest_private_key": null,
+        "host_peer_id": "walker-123",
+        "assigned_peer_id": "peer-abc",
+        "host_signing_key": [32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1]
+    }"#;
+
+    let invite: InvitePayload = from_json_str(js_staged_invite_json)
+        .expect("JS _stageNewInvite JSON must cleanly deserialize into InvitePayload without 400");
+    assert_eq!(invite.do_id, "clifton-commons");
+    assert_eq!(invite.invite_uuid, "inv-walker-123-abc");
+    assert_eq!(invite.token, "a1b2c3d4e5f6");
+    assert_eq!(invite.sdp_offer.sdp, "v=0\r\no=FakeOffer\r\n");
+    assert_eq!(invite.guest_private_key, None);
+    assert_eq!(invite.host_peer_id, Some("walker-123".to_string()));
+    assert_eq!(invite.assigned_peer_id, Some("peer-abc".to_string()));
+
+    // 2. Exact JSON string shape produced by ZeroMeshNetworkManager._connectLiveMesh in zero_mesh_network.js
+    let js_drop_payload_json = r#"{
+        "invite_uuid": "inv-walker-123-abc",
+        "token": "a1b2c3d4e5f6",
+        "sdp_answer": { "sdp": "SEALED" },
+        "joiner_public_key": [2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33],
+        "joiner_peer_id": "peer-abc",
+        "joiner_signing_key": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32],
+        "sealed_sdp_answer": {
+            "ciphertext": [10, 20, 30],
+            "nonce": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        },
+        "signature": null
+    }"#;
+
+    let drop: DropPayload = from_json_str(js_drop_payload_json)
+        .expect("JS _connectLiveMesh dropPayload JSON must cleanly deserialize into DropPayload without 400");
+    assert_eq!(drop.invite_uuid, "inv-walker-123-abc");
+    assert_eq!(drop.token, "a1b2c3d4e5f6");
+    assert_eq!(drop.sdp_answer.sdp, "SEALED");
+    assert_eq!(drop.joiner_peer_id, Some("peer-abc".to_string()));
+    assert_eq!(drop.signature, None);
+    assert!(drop.sealed_sdp_answer.is_some());
+}
+
+#[test]
 fn test_invite_payload_backward_compatibility() {
     let legacy_json = format!(
         r#"{{
