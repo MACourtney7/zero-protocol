@@ -348,7 +348,8 @@ fn test_wasm_mesh_topology_remove_peer_and_disconnect_peer() {
     let peer_engine = WasmWebRtcEngine::new();
     peer_engine.mark_open().expect("mark_open");
     let peer_pub = [99u8; 32];
-    top.register_peer("bob", &peer_pub, &peer_engine).expect("register bob");
+    top.register_peer("bob", &peer_pub, &peer_engine)
+        .expect("register bob");
     assert_eq!(top.peer_count(), 1);
     assert!(top.has_peer("bob"));
 
@@ -360,7 +361,8 @@ fn test_wasm_mesh_topology_remove_peer_and_disconnect_peer() {
     // register fresh peer and test disconnect_peer
     let charlie_engine = WasmWebRtcEngine::new();
     charlie_engine.mark_open().expect("mark_open charlie");
-    top.register_peer("charlie", &peer_pub, &charlie_engine).expect("register charlie");
+    top.register_peer("charlie", &peer_pub, &charlie_engine)
+        .expect("register charlie");
     assert_eq!(top.peer_count(), 1);
     assert!(top.has_peer("charlie"));
     top.disconnect_peer("charlie").expect("disconnect charlie");
