@@ -34,6 +34,12 @@ impl WasmMeshTopology {
         self.topology.local_peer_id()
     }
 
+    /// Updates the local peer identifier while preserving all registered peers
+    /// and vector clocks (unification-016).
+    pub fn set_local_peer_id(&self, new_peer_id: String) {
+        self.topology.set_local_peer_id(&new_peer_id);
+    }
+
     /// Returns the 32-byte local public key.
     pub fn local_public_key(&self) -> Vec<u8> {
         self.topology.local_public_key().to_vec()

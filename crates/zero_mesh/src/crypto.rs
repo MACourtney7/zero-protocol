@@ -238,7 +238,36 @@ impl WasmCryptoSession {
         })
     }
 
-    /// Returns the 32-byte X25519 public key bytes.
+    /// Creates a `WasmCryptoSession` from an explicit 32-byte X25519 private key scalar.
+    ///
+    /// The X25519 public key is derived from the supplied scalar. A fresh Ed25519
+    /// signing keypair is generated for message authentication.
+    pub fn from_private_key(bytes: &[u8]) -> Result<WasmCryptoSession, JsValue> {
+        if bytes.len() != KEY_LEN {
+            return Err(js_error(format!(
+                "Invalid private key length: expected {}, got {}",
+                KEY_LEN,
+                bytes.len()
+            )));
+        }
+        let mut private_key = [0u8; KEY_LEN];
+        private_key.copy_from_slice(bytes);
+
+        let x25519 = x25519::X25519Keypair::from_private_key(private_key);
+        let ed25519 = zero_protocol::crypto::ed25519::Ed25519Keypair::generate().map_err(js_error)?;
+
+        Ok(WasmCryptoSession {
+            bundle: BurnerKeybundle { x25519, ed25519 },
+            peer_sessions: HashMap::new(),
+        })
+    }
+
+    /// Returns the 32-byte X25519 private key scalar.
+    pub fn private_key_bytes(&self) -> Vec<u8> {
+        self.bundle.x25519.private_key_bytes().to_vec()
+    }
+
+    /// Returns the 32-byte X25519 public key bytes matching the private scalar.
     pub fn x25519_public_key_bytes(&self) -> Vec<u8> {
         self.bundle.x25519_public_key().to_vec()
     }
@@ -890,6 +919,59 @@ mod tests {
         let expected =
             zero_protocol::crypto::hmac_sha256::compute_invite_token(secret, uuid).unwrap();
         assert_eq!(token, expected.hmac_hex);
+    }
+
+    #[test]
+    fn test_wasm_crypto_session_from_private_key_roundtrip() {
+        let scalar = [0x42u8; KEY_LEN];
+        let session = WasmCryptoSession::from_private_key(&scalar).expect("from private key");
+
+        // Private key roundtrips exactly.
+        assert_eq!(session.private_key_bytes(), scalar.to_vec());
+
+        // Public key matches the one derived from the same scalar.
+        let expected = x25519::X25519Keypair::from_private_key(scalar);
+        assert_eq!(
+            session.x25519_public_key_bytes(),
+            expected.public_key_bytes().to_vec()
+        );
+
+        // Invalid lengths are rejected.
+        assert!(WasmCryptoSession::from_private_key(&[0u8; 16]).is_err());
+        assert!(WasmCryptoSession::from_private_key(&[0u8; 33]).is_err());
+    }
+
+    #[test]
+    fn test_wasm_crypto_session_from_private_key_exchange() {
+        let alice_scalar = [0x11u8; KEY_LEN];
+        let bob_scalar = [0x22u8; KEY_LEN];
+
+        let mut alice = WasmCryptoSession::from_private_key(&alice_scalar).expect("alice");
+        let mut bob = WasmCryptoSession::from_private_key(&bob_scalar).expect("bob");
+
+        alice
+            .register_peer(
+                "bob",
+                &bob.x25519_public_key_bytes(),
+                Some(bob.ed25519_public_key_bytes()),
+            )
+            .expect("register bob on alice");
+        bob.register_peer(
+            "alice",
+            &alice.x25519_public_key_bytes(),
+            Some(alice.ed25519_public_key_bytes()),
+        )
+        .expect("register alice on bob");
+
+        let msg = b"Deterministic keypair exchange payload";
+        let sealed = alice.seal_for_peer("bob", msg).expect("seal");
+        let opened = bob.open_from_peer("alice", &sealed).expect("open");
+        assert_eq!(opened, msg);
+
+        // Reverse direction.
+        let sealed_back = bob.seal_for_peer("alice", msg).expect("seal back");
+        let opened_back = alice.open_from_peer("bob", &sealed_back).expect("open back");
+        assert_eq!(opened_back, msg);
     }
 
     #[test]
