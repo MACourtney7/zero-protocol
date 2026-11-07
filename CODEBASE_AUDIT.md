@@ -303,7 +303,8 @@ impl WasmCryptoSession {
         private_key.copy_from_slice(bytes);
 
         let x25519 = x25519::X25519Keypair::from_private_key(private_key);
-        let ed25519 = zero_protocol::crypto::ed25519::Ed25519Keypair::generate().map_err(js_error)?;
+        let ed25519 =
+            zero_protocol::crypto::ed25519::Ed25519Keypair::generate().map_err(js_error)?;
 
         Ok(WasmCryptoSession {
             bundle: BurnerKeybundle { x25519, ed25519 },
@@ -1019,7 +1020,9 @@ mod tests {
 
         // Reverse direction.
         let sealed_back = bob.seal_for_peer("alice", msg).expect("seal back");
-        let opened_back = alice.open_from_peer("bob", &sealed_back).expect("open back");
+        let opened_back = alice
+            .open_from_peer("bob", &sealed_back)
+            .expect("open back");
         assert_eq!(opened_back, msg);
     }
 
@@ -6343,8 +6346,7 @@ fn test_mismatched_keypair_fails_aead() {
     assert_eq!(opened, b"top secret payload");
 
     // Bob (mis-registered) opens using a mismatched public key: must fail AEAD.
-    let mismatched_crypto =
-        ChatSessionCrypto::from_keypair_and_peer_public(&bob_sk, &mallory_pk);
+    let mismatched_crypto = ChatSessionCrypto::from_keypair_and_peer_public(&bob_sk, &mallory_pk);
     let err = mismatched_crypto.open_raw(&sealed);
     assert!(
         err.is_err(),
