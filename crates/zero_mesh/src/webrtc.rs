@@ -275,6 +275,7 @@ struct PeerSessionInner {
     text_callbacks: Vec<TextCallback>,
     binary_callbacks: Vec<BinaryCallback>,
     state_callbacks: Vec<StateCallback>,
+    outbound_tx_hook: Option<Rc<dyn Fn(&str)>>,
     outbound_queue: Vec<DataChannelMessage>,
     paired_peer: Option<Weak<RefCell<PeerSessionInner>>>,
 }
@@ -292,6 +293,7 @@ impl PeerSessionInner {
             text_callbacks: Vec::new(),
             binary_callbacks: Vec::new(),
             state_callbacks: Vec::new(),
+            outbound_tx_hook: None,
             outbound_queue: Vec::new(),
             paired_peer: None,
         }
@@ -385,6 +387,11 @@ impl WebRtcPeer {
             .borrow_mut()
             .state_callbacks
             .push(Rc::new(callback));
+    }
+
+    /// Sets an outbound transmission hook invoked whenever text is sent via `send_text`.
+    pub fn set_outbound_tx_hook<F: Fn(&str) + 'static>(&self, hook: F) {
+        self.inner.borrow_mut().outbound_tx_hook = Some(Rc::new(hook));
     }
 
     fn set_state_and_notify(
@@ -495,7 +502,7 @@ impl WebRtcPeer {
 
     /// Sends a UTF-8 text message over the open data channel.
     pub fn send_text(&self, text: &str) -> Result<(), WebRtcError> {
-        let paired = {
+        let (paired, outbound_hook) = {
             let mut inner = self.inner.borrow_mut();
             if inner.state != PeerLifecycleState::Open {
                 return Err(WebRtcError::ChannelNotOpen(inner.state));
@@ -503,8 +510,14 @@ impl WebRtcPeer {
             inner
                 .outbound_queue
                 .push(DataChannelMessage::Text(text.to_string()));
-            inner.paired_peer.as_ref().and_then(Weak::upgrade)
+            let paired = inner.paired_peer.as_ref().and_then(Weak::upgrade);
+            let hook = inner.outbound_tx_hook.clone();
+            (paired, hook)
         };
+
+        if let Some(hook) = outbound_hook {
+            hook(text);
+        }
 
         if let Some(remote_inner) = paired {
             let remote_peer = WebRtcPeer {
@@ -693,6 +706,28 @@ impl WasmWebRtcEngine {
 
     /// Closes the data channel and peer connection.
     pub fn close(&self) -> Result<(), JsValue> {
+        self.peer.close().map_err(Into::into)
+    }
+
+    /// Sets an outbound transmission callback `(text: string) => void` invoked when text is sent.
+    pub fn set_outbound_tx(&self, callback: js_sys::Function) {
+        self.peer.set_outbound_tx_hook(move |text| {
+            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(text));
+        });
+    }
+
+    /// Injects an incoming text message into this peer's receive pipeline.
+    pub fn inject_incoming_text(&self, text: &str) {
+        self.peer.receive_text(text);
+    }
+
+    /// Transitions the peer state to `Open` directly for deterministic bridging/testing.
+    pub fn mark_open(&self) -> Result<(), JsValue> {
+        self.peer.mark_open_for_testing().map_err(Into::into)
+    }
+
+    /// Transitions the peer state to `Closed` directly.
+    pub fn mark_closed(&self) -> Result<(), JsValue> {
         self.peer.close().map_err(Into::into)
     }
 }

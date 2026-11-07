@@ -68,6 +68,20 @@ impl WasmMeshTopology {
         self.topology.has_peer(peer_id)
     }
 
+    /// Removes a peer from the mesh topology and closes its channel.
+    pub fn remove_peer(&self, peer_id: &str) -> Result<(), JsValue> {
+        self.topology
+            .remove_peer(peer_id)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Disconnects a peer from the mesh topology and closes its channel.
+    pub fn disconnect_peer(&self, peer_id: &str) -> Result<(), JsValue> {
+        self.topology
+            .disconnect_peer(peer_id)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Broadcasts a chat message across all connected peers.
     pub fn broadcast_chat(&self, plaintext: &str) -> Result<String, JsValue> {
         self.topology
