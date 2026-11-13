@@ -1025,8 +1025,7 @@ mod tests {
     fn test_wasm_crypto_session_compute_hmac_hex() {
         let secret = b"super_secret_key_32_bytes_value!";
         let uuid = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
-        let token =
-            WasmCryptoSession::compute_hmac_hex_bytes(secret, uuid).expect("compute hmac");
+        let token = WasmCryptoSession::compute_hmac_hex_bytes(secret, uuid).expect("compute hmac");
         assert_eq!(token.len(), 64);
 
         // Verify against zero_protocol directly
